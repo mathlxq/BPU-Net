@@ -1,0 +1,240 @@
+from skimage.measure import label
+import cv2
+import os, copy
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torchvision.transforms import Compose, ToTensor, Normalize
+from torchvision.transforms.functional import gaussian_blur
+from segmentation.model import BP_UNet
+from segmentation.tools import posprecess, stitch, proprecess_img, tailor, download_from_url
+import time
+from segmentation.evaluation import eval_RI_VI, eval_F_mapKaggle
+
+
+# 新增动态权重计算模块（不修改原有模块结构，直接嵌入）
+class DynamicWeightModule(nn.Module):
+    def __init__(self, feature_dim=64, temperature_init=2.0, bias_init=-0.5):
+        super(DynamicWeightModule, self).__init__()
+        # 可学习的质量指标权重参数
+        self.alpha = nn.Parameter(torch.tensor(1.0 / 3), requires_grad=True)
+        self.beta = nn.Parameter(torch.tensor(1.0 / 3), requires_grad=True)
+        self.gamma = nn.Parameter(torch.tensor(1.0 / 3), requires_grad=True)
+        # 温度系数与偏置项
+        self.temperature = temperature_init
+        self.bias = nn.Parameter(torch.tensor(bias_init), requires_grad=True)
+        # Sobel算子（用于边缘清晰度计算）
+        self.sobel_x = nn.Parameter(torch.tensor([[[[-1, 0, 1], [-2, 0, 2], [-1, 0, 1]]]], dtype=torch.float32),
+                                    requires_grad=False)
+        self.sobel_y = nn.Parameter(torch.tensor([[[[-1, -2, -1], [0, 0, 0], [1, 2, 1]]]], dtype=torch.float32),
+                                    requires_grad=False)
+        # 特征维度适配卷积
+        self.adapt_conv = nn.Conv2d(feature_dim * 2, feature_dim, kernel_size=1, stride=1, padding=0)
+
+    def normalize(self, x):
+        """将张量归一化到[0,1]区间"""
+        return (x - x.min()) / (x.max() - x.min() + 1e-8)
+
+    def compute_edge_sharpness(self, x):
+        """计算边缘清晰度（ES）"""
+        b, c, h, w = x.shape
+        sobel_x = self.sobel_x.repeat(1, c, 1, 1)
+        sobel_y = self.sobel_y.repeat(1, c, 1, 1)
+        grad_x = F.conv2d(x, sobel_x, padding=1)
+        grad_y = F.conv2d(x, sobel_y, padding=1)
+        grad_mag = torch.sqrt(grad_x ** 2 + grad_y ** 2 + 1e-8)
+        es = torch.mean(grad_mag, dim=[2, 3])
+        es = torch.mean(es, dim=1)
+        return self.normalize(es)
+
+    def compute_snr(self, x):
+        """计算信噪比（SNR）"""
+        b, c, h, w = x.shape
+        signal = gaussian_blur(x, kernel_size=3, sigma=1.0)
+        noise = x - signal
+        signal_energy = torch.sum(signal ** 2, dim=[1, 2, 3])
+        noise_energy = torch.sum(noise ** 2, dim=[1, 2, 3])
+        snr = 10 * torch.log10(signal_energy / (noise_energy + 1e-8))
+        return self.normalize(snr)
+
+    def compute_feature_consistency(self, x_prev, x_curr):
+        """计算特征一致性（FC）"""
+        b, c, h, w = x_prev.shape
+        mu_prev = F.avg_pool2d(x_prev, kernel_size=3, stride=1, padding=1)
+        mu_curr = F.avg_pool2d(x_curr, kernel_size=3, stride=1, padding=1)
+        sigma_prev = F.avg_pool2d(x_prev ** 2, kernel_size=3, stride=1, padding=1) - mu_prev ** 2
+        sigma_curr = F.avg_pool2d(x_curr ** 2, kernel_size=3, stride=1, padding=1) - mu_curr ** 2
+        sigma_prev_curr = F.avg_pool2d(x_prev * x_curr, kernel_size=3, stride=1, padding=1) - mu_prev * mu_curr
+        C1 = (0.01 * 255) ** 2
+        C2 = (0.03 * 255) ** 2
+        ssim = ((2 * mu_prev * mu_curr + C1) * (2 * sigma_prev_curr + C2)) / \
+               ((mu_prev ** 2 + mu_curr ** 2 + C1) * (sigma_prev + sigma_curr + C2 + 1e-8))
+        fc = torch.mean(ssim, dim=[1, 2, 3])
+        return fc
+
+    def forward(self, x_prev, x_curr):
+        """前向传播：计算动态权重并融合特征"""
+        # 计算质量指标
+        es = self.compute_edge_sharpness(x_prev)
+        snr = self.compute_snr(x_prev)
+        fc = self.compute_feature_consistency(x_prev, x_curr)
+
+        # 归一化指标权重
+        weights = torch.softmax(torch.stack([self.alpha, self.beta, self.gamma]), dim=0)
+        alpha_norm, beta_norm, gamma_norm = weights[0], weights[1], weights[2]
+
+        # 计算综合质量得分与动态权重
+        quality = alpha_norm * es + beta_norm * snr + gamma_norm * fc
+        weight = torch.sigmoid(quality * self.temperature + self.bias)
+        weight = torch.clamp(weight, min=0.1, max=0.95)
+        weight = weight.unsqueeze(1).unsqueeze(2).unsqueeze(3)
+
+        # 特征融合
+        F_fuse = (1 - weight) * x_curr + weight * x_prev
+        F_fuse = self.adapt_conv(torch.cat([F_fuse, x_curr], dim=1))
+        F_fuse = F.relu(F_fuse)
+
+        return F_fuse, weight.squeeze()
+
+
+def inference():
+    '''
+    predict results and evaluate on test samples for segmentation with wpu-net
+    '''
+    transform = Compose([
+        ToTensor(),
+        Normalize(mean=[0.9336267],  # RGB
+                  std=[0.1365774])
+    ])
+    cwd = os.getcwd()
+    print(cwd)
+    output_test_dir = os.path.join(cwd, "datasets1", "segmentation", "net_test", "test")
+    # generate overlapping cropped image for test
+    output_test_crop_dir = os.path.join(cwd, "datasets1", "segmentation", "net_test", "test_overlap_crop")
+    if not os.path.exists(output_test_crop_dir):
+        os.mkdir(output_test_crop_dir)
+        os.mkdir(os.path.join(output_test_crop_dir, 'images'))
+        os.mkdir(os.path.join(output_test_crop_dir, 'labels'))
+    # for item in sorted(os.listdir(os.path.join(output_test_dir, 'images'))):
+    #   tailor(256, 256, os.path.join(output_test_dir, 'images', item), os.path.join(output_test_crop_dir, 'images'),region=32)
+    #  tailor(256, 256, os.path.join(output_test_dir, 'labels', item), os.path.join(output_test_crop_dir, 'labels'),region=32)
+    key_name = 'BP_Unet'
+    model_path = os.path.join(cwd, 'segmentation', 'parameter', key_name, 'best_model_state.pth')
+    result_save_dir = os.path.join(cwd, 'segmentation', 'result', key_name)
+    result_total_save_dir = os.path.join(cwd, 'segmentation', 'result_total', key_name)
+    if not os.path.exists(result_save_dir):
+        os.makedirs(result_save_dir)
+    if not os.path.exists(result_total_save_dir):
+        os.makedirs(result_total_save_dir)
+    model = BP_UNet(num_channels=2, num_classes=2, multi_layer=True)
+
+    # 初始化动态权重模块（新增）
+    dynamic_weight_module = DynamicWeightModule(feature_dim=64)
+
+    if torch.cuda.is_available():
+        model = nn.DataParallel(model).cuda()
+        dynamic_weight_module = nn.DataParallel(dynamic_weight_module).cuda()  # 动态权重模块GPU加速
+    # 先加载模型参数dict文件
+    state_dict = torch.load(model_path)
+    from collections import OrderedDict
+    # 初始化一个空 dict
+    new_state_dict = OrderedDict()
+    # 修改 key，没有module字段则需要不上，如果有，则需要修改为 module.features
+    for k, v in state_dict.items():
+        if 'module' not in k:
+            k = 'module.' + k
+        else:
+            k = k.replace('features.module.', 'module.features.')
+        new_state_dict[k] = v
+    # 加载修改后的新参数dict文件
+    model.load_state_dict(new_state_dict)
+    # 动态权重模块设为评估模式（新增）
+    dynamic_weight_module.eval()
+
+    model.eval()
+    # inferece cropped images
+    images = sorted(os.listdir(os.path.join(output_test_crop_dir, "images")))
+    print(len(images))
+    start_time = time.time()
+    count = 0
+    min_file = 149  # 1  117  149
+    max_file = 296  # 116  148  296
+
+    # 存储前一切片的模型输出特征（用于动态权重计算）
+    prev_slice_feat = None
+
+    with torch.no_grad():
+        for item in images:
+            if item.endswith(".png"):
+                filename = item.split(".")[0]
+                pic_num = item.split("_")[0]
+                if int(pic_num) > min_file and int(pic_num) <= max_file:
+                    count += 1
+                    test_image = os.path.join(output_test_crop_dir, "images", filename + ".png")
+                    img = proprecess_img(test_image)
+                    # last mask
+                    last_name = str(int(pic_num) - 1).zfill(3) + '_' + filename.split('_')[1] + '_' + \
+                                filename.split('_')[2]
+                    last_mask = cv2.imread(os.path.join(output_test_crop_dir, "labels", last_name + ".png"), 0)
+                    last_tensor = torch.Tensor(np.array(last_mask)).unsqueeze(0).unsqueeze(0)
+                    last_tensor[last_tensor == 255] = -6
+                    last_tensor[last_tensor == 0] = 1
+
+                    # 动态权重计算与特征融合（新增核心逻辑）
+                    if prev_slice_feat is not None and img.shape == prev_slice_feat.shape:
+                        # 计算当前图像的基础特征（使用img作为当前特征代理，不修改原有模型结构）
+                        curr_feat = img.expand(-1, 64, -1, -1)  # 扩展通道数匹配特征维度
+                        prev_feat = prev_slice_feat.expand(-1, 64, -1, -1)
+
+                        # 计算动态权重并融合特征
+                        fused_feat, weight = dynamic_weight_module(prev_feat, curr_feat)
+                        print(f"处理图像 {filename}，动态权重值：{weight.item():.4f}")
+
+                        # 特征融合后传入模型（通过last_tensor间接传递融合特征，不修改原有模型输入接口）
+                        last_tensor = last_tensor + fused_feat[:, :1, :, :]  # 单通道适配
+
+                    # 原有模型推理逻辑不变
+                    output = model(inputs=img, last=last_tensor)
+
+                    # 存储当前切片特征用于下一张图像计算（新增）
+                    prev_slice_feat = output.detach()
+
+                    result_npy = posprecess(output, close=True)
+                    cv2.imwrite(os.path.join(result_save_dir, filename + ".png"), result_npy)
+    end_time = time.time()
+    average_time = (end_time - start_time) / count
+    print("end ...", average_time)
+    # stitch cropped images
+    imgList = sorted(os.listdir(os.path.join(output_test_dir, "images")))
+    print(len(imgList))
+    n = 0
+    for img in imgList:
+        if img.endswith(".png"):
+            name = img.split(".")[0]
+            if int(name) > min_file and int(name) <= max_file:
+                print('you are stitching picture ', name)
+                stitch(256, 256, name, result_save_dir, os.path.join(result_total_save_dir, name + ".png"), 32)
+                n += 1
+    print("end...")
+    # evaluate
+    RI_save_dir = os.path.join(cwd, 'segmentation', 'evaluations', 'big_RI_VI')
+    Map_save_dir = os.path.join(cwd, 'segmentation', 'evaluations', 'big_F_mAP')
+    if not os.path.exists(RI_save_dir):
+        os.makedirs(RI_save_dir)
+    if not os.path.exists(Map_save_dir):
+        os.makedirs(Map_save_dir)
+    print(key_name + " model " + "#####" * 20)
+
+    eval_RI_VI(os.path.join(cwd, 'segmentation', 'result_total', key_name),
+               os.path.join(RI_save_dir, key_name + ".txt"),
+               gt_dir=os.path.join(cwd, 'datasets', 'segmentation', 'net_test', 'test', 'labels'))
+    eval_F_mapKaggle(os.path.join(cwd, 'segmentation', 'result_total', key_name),
+                     os.path.join(Map_save_dir, key_name + ".txt"),
+                     gt_dir=os.path.join(cwd, 'datasets', 'segmentation', 'net_test', 'test', 'labels'))
+
+
+if __name__ == "__main__":
+    print('############## segmentation inference  ##############')
+    inference()
+    print('##############   inference completed   ##############')
