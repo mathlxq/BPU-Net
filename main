@@ -15,27 +15,21 @@ from segmentation.evaluation import eval_RI_VI, eval_F_mapKaggle
 class DynamicWeightModule(nn.Module):
     def __init__(self, feature_dim=64, temperature_init=2.0, bias_init=-0.5):
         super(DynamicWeightModule, self).__init__()
-        # 可学习的质量指标权重参数
         self.alpha = nn.Parameter(torch.tensor(1.0 / 3), requires_grad=True)
         self.beta = nn.Parameter(torch.tensor(1.0 / 3), requires_grad=True)
         self.gamma = nn.Parameter(torch.tensor(1.0 / 3), requires_grad=True)
-        # 温度系数与偏置项
         self.temperature = temperature_init
         self.bias = nn.Parameter(torch.tensor(bias_init), requires_grad=True)
-        # Sobel算子（用于边缘清晰度计算）
         self.sobel_x = nn.Parameter(torch.tensor([[[[-1, 0, 1], [-2, 0, 2], [-1, 0, 1]]]], dtype=torch.float32),
                                     requires_grad=False)
         self.sobel_y = nn.Parameter(torch.tensor([[[[-1, -2, -1], [0, 0, 0], [1, 2, 1]]]], dtype=torch.float32),
                                     requires_grad=False)
-        # 特征维度适配卷积
         self.adapt_conv = nn.Conv2d(feature_dim * 2, feature_dim, kernel_size=1, stride=1, padding=0)
 
     def normalize(self, x):
-        """将张量归一化到[0,1]区间"""
         return (x - x.min()) / (x.max() - x.min() + 1e-8)
 
     def compute_edge_sharpness(self, x):
-        """计算边缘清晰度（ES）"""
         b, c, h, w = x.shape
         sobel_x = self.sobel_x.repeat(1, c, 1, 1)
         sobel_y = self.sobel_y.repeat(1, c, 1, 1)
@@ -47,7 +41,6 @@ class DynamicWeightModule(nn.Module):
         return self.normalize(es)
 
     def compute_snr(self, x):
-        """计算信噪比（SNR）"""
         b, c, h, w = x.shape
         signal = gaussian_blur(x, kernel_size=3, sigma=1.0)
         noise = x - signal
@@ -57,7 +50,6 @@ class DynamicWeightModule(nn.Module):
         return self.normalize(snr)
 
     def compute_feature_consistency(self, x_prev, x_curr):
-        """计算特征一致性（FC）"""
         b, c, h, w = x_prev.shape
         mu_prev = F.avg_pool2d(x_prev, kernel_size=3, stride=1, padding=1)
         mu_curr = F.avg_pool2d(x_curr, kernel_size=3, stride=1, padding=1)
@@ -72,8 +64,6 @@ class DynamicWeightModule(nn.Module):
         return fc
 
     def forward(self, x_prev, x_curr):
-        """前向传播：计算动态权重并融合特征"""
-        # 计算质量指标
         es = self.compute_edge_sharpness(x_prev)
         snr = self.compute_snr(x_prev)
         fc = self.compute_feature_consistency(x_prev, x_curr)
@@ -138,14 +128,12 @@ def inference():
     from collections import OrderedDict
     # 初始化一个空 dict
     new_state_dict = OrderedDict()
-    # 修改 key，没有module字段则需要不上，如果有，则需要修改为 module.features
     for k, v in state_dict.items():
         if 'module' not in k:
             k = 'module.' + k
         else:
             k = k.replace('features.module.', 'module.features.')
         new_state_dict[k] = v
-    # 加载修改后的新参数dict文件
     model.load_state_dict(new_state_dict)
     # 动态权重模块设为评估模式（新增）
     dynamic_weight_module.eval()
@@ -184,18 +172,12 @@ def inference():
                         # 计算当前图像的基础特征（使用img作为当前特征代理，不修改原有模型结构）
                         curr_feat = img.expand(-1, 64, -1, -1)  # 扩展通道数匹配特征维度
                         prev_feat = prev_slice_feat.expand(-1, 64, -1, -1)
-
-                        # 计算动态权重并融合特征
                         fused_feat, weight = dynamic_weight_module(prev_feat, curr_feat)
                         print(f"处理图像 {filename}，动态权重值：{weight.item():.4f}")
 
-                        # 特征融合后传入模型（通过last_tensor间接传递融合特征，不修改原有模型输入接口）
                         last_tensor = last_tensor + fused_feat[:, :1, :, :]  # 单通道适配
 
-                    # 原有模型推理逻辑不变
-                    output = model(inputs=img, last=last_tensor)
-
-                    # 存储当前切片特征用于下一张图像计算（新增）
+                     output = model(inputs=img, last=last_tensor)
                     prev_slice_feat = output.detach()
 
                     result_npy = posprecess(output, close=True)
