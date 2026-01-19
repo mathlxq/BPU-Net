@@ -12,8 +12,6 @@ from segmentation.tools import posprecess, stitch, proprecess_img, tailor, downl
 import time
 from segmentation.evaluation import eval_RI_VI, eval_F_mapKaggle
 
-
-# 新增动态权重计算模块（不修改原有模块结构，直接嵌入）
 class DynamicWeightModule(nn.Module):
     def __init__(self, feature_dim=64, temperature_init=2.0, bias_init=-0.5):
         super(DynamicWeightModule, self).__init__()
