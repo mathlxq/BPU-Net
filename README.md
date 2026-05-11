@@ -18,6 +18,6 @@ python train.py
 
 
 
-You can download dataset from https://github.com/Keep-Passion/pure_iron_grain_data_sets.
+
 
 
